@@ -31,6 +31,18 @@ ALLOWED = {"Read", "mcp__underwriting__run_ocr_normalizer",
 CHUNK_LIMIT = 16000
 MAX_PROPOSAL_CHARS = 2_000_000
 REQUEST_TIMEOUT_MS = 180_000
+NARRATIVE_PERSONA_NAME = "compliance-narrative-explainer"
+NARRATIVE_PERSONA = ("Explain deterministic underwriting evidence in plain language for non-expert "
+                     "reviewers. Copy every figure verbatim from the supplied evidence; never compute, "
+                     "round, convert or invent values. You have no financing, approval or settlement "
+                     "authority and no access to later-stage tools.")
+NARRATIVE_ALLOWED = {"mcp__narrative__read_evidence_chunk", "mcp__narrative__submit_decision_memo"}
+NARRATIVE_BLOCKED = BLOCKED | {"Read", "mcp__underwriting__run_ocr_normalizer",
+                               "mcp__underwriting__read_evidence_chunk", "mcp__underwriting__submit_trade_proposal"}
+NARRATIVE_TIMEOUT_MS = 120_000
+NARRATIVE_TOOL_BUDGET = 32
+NARRATIVE_FIGURE_KEYS = {"variance", "invoice_total", "verified_inflow", "default_probability",
+                         "dsr", "existing_dsr", "requested_limit", "approved_limit", "proposed_limit"}
 
 
 class SDKRuntime:
@@ -339,4 +351,153 @@ class SDKRuntime:
             raise EvidenceError("SDK extraction failed or timed out") from exc
         except BaseException:
             self.proposal = None
+            raise
+
+
+class NarrativeRuntime:
+    """Bounded live SDK explainer for the deterministic decision memo.
+
+    Separate MCP server, separate persona, read-only chunk access to finalized
+    evidence JSON. The submitted narrative is accepted only when its figures
+    exactly equal the scheduler's deterministic values; the audit and gates
+    remain the sole authorities. Opt-in via OUT_IN_NARRATIVE_AGENT=1 in live
+    mode; deterministic text is always computed first as the fallback.
+    """
+
+    def __init__(self, job_dir: Path, emit):
+        self.job_dir, self.emit = job_dir.resolve(), emit
+        self.memo = None
+        self.tool_calls = 0
+        self.tool_budget = NARRATIVE_TOOL_BUDGET
+        self.expected_figures = {}
+        self._evidence_text = {}
+
+    def _register_evidence(self, evidence_paths):
+        self._evidence_text = {}
+        for index, value in enumerate(evidence_paths, 1):
+            path = Path(value)
+            if not path.is_absolute():
+                path = self.job_dir / path
+            path = path.resolve()
+            if not path.is_relative_to(self.job_dir / "evidence") or path.suffix != ".json":
+                raise EvidenceError("Narrative evidence must be finalized job evidence JSON")
+            if path.is_symlink() or not path.is_file():
+                raise EvidenceError("Narrative evidence must be a regular finalized file")
+            text = path.read_text(encoding="utf-8")
+            if len(text) > MAX_PROPOSAL_CHARS or not isinstance(json.loads(text), (dict, list)):
+                raise EvidenceError("Narrative evidence exceeds bounds or is not JSON")
+            self._evidence_text[f"evidence-{index}"] = text
+        if not self._evidence_text:
+            raise EvidenceError("Narrative explanation requires finalized evidence")
+        self.tool_budget = NARRATIVE_TOOL_BUDGET + sum(
+            (len(text) + CHUNK_LIMIT - 1) // CHUNK_LIMIT for text in self._evidence_text.values())
+
+    def read_evidence_chunk(self, evidence_id: str, offset: int, limit: int):
+        if not isinstance(evidence_id, str) or evidence_id not in self._evidence_text:
+            raise EvidenceError("Unknown narrative evidence ID; filesystem paths are not accepted")
+        if type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= CHUNK_LIMIT:
+            raise EvidenceError("Chunk offset must be nonnegative and limit must be 1..16000")
+        text = self._evidence_text[evidence_id]
+        if offset > len(text):
+            raise EvidenceError("Chunk offset exceeds evidence length")
+        next_offset = min(offset + limit, len(text))
+        return {"evidence_id": evidence_id, "offset": offset, "text": text[offset:next_offset],
+                "total": len(text), "next_offset": next_offset, "complete": next_offset == len(text)}
+
+    async def pre_tool(self, input_data, tool_use_id=None, context=None):
+        name = input_data.get("tool_name", "")
+        if name in NARRATIVE_BLOCKED or name not in NARRATIVE_ALLOWED:
+            self.emit("TOOL_EXECUTION", {"agent": NARRATIVE_PERSONA_NAME, "tool": name, "status": "BLOCKED"})
+            return {"decision": "block", "reason": "Tool not authorized for narrative explanation", "stopReason": "Unauthorized tool"}
+        self.tool_calls += 1
+        if self.tool_calls > self.tool_budget:
+            return {"decision": "block", "reason": "Narrative tool budget exhausted", "stopReason": "Tool budget exhausted"}
+        return {}
+
+    def submit_decision_memo(self, args):
+        from tools.decision_memo_tool import bounded_text, TEXT_LIMITS
+        if self.memo is not None:
+            raise EvidenceError("Only one narrative memo allowed per bounded session")
+        if not isinstance(args, dict):
+            raise EvidenceError("Narrative memo must be an object")
+        figures = args.get("figures")
+        if (not isinstance(figures, dict) or set(figures) != set(self.expected_figures)
+                or any(not isinstance(value, str) for value in figures.values())
+                or figures != self.expected_figures
+                or set(figures) - NARRATIVE_FIGURE_KEYS):
+            raise EvidenceError("Narrative figures must exactly equal the deterministic evidence values")
+        reasons, steps = args.get("reasons"), args.get("next_steps")
+        if (not isinstance(reasons, list) or not 1 <= len(reasons) <= 12
+                or not isinstance(steps, list) or len(steps) > 8):
+            raise EvidenceError("Narrative memo needs 1..12 reasons and at most 8 next steps")
+        self.memo = {"headline": bounded_text(args.get("headline"), TEXT_LIMITS["headline"], "headline"),
+                     "summary": bounded_text(args.get("summary"), TEXT_LIMITS["summary"], "summary"),
+                     "reasons": [bounded_text(r, TEXT_LIMITS["reason"], "reason") for r in reasons],
+                     "next_steps": [bounded_text(s, TEXT_LIMITS["step"], "step") for s in steps],
+                     "figures": dict(figures)}
+        return {"content": [{"type": "text", "text": '{"accepted_for_validation":true}'}]}
+
+    def server(self):
+        @tool("read_evidence_chunk", "Read every chunk of a registered finalized evidence ID; offsets and totals count characters, not bytes", {"evidence_id": str, "offset": int, "limit": int})
+        async def read_chunk(args):
+            result = self.read_evidence_chunk(args["evidence_id"], args["offset"], args["limit"])
+            return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
+
+        @tool("submit_decision_memo", "Submit a plain-language memo whose figures exactly equal the deterministic evidence; no financing decision", {"headline": str, "summary": str, "reasons": list, "next_steps": list, "figures": dict})
+        async def submit(args):
+            return self.submit_decision_memo(args)
+        return create_sdk_mcp_server(name="narrative", version="1.0.0", tools=[read_chunk, submit])
+
+    def options(self):
+        return CodeBuddyAgentOptions(permission_mode="bypassPermissions", cwd=str(self.job_dir),
+                                    model="deepseek-v3.1", max_turns=8, tools=[],
+                                    allowed_tools=sorted(NARRATIVE_ALLOWED),
+                                    disallowed_tools=sorted(NARRATIVE_BLOCKED),
+                                    setting_sources=[],
+                                    agents={NARRATIVE_PERSONA_NAME: AgentDefinition(
+                                        description=NARRATIVE_PERSONA_NAME, prompt=NARRATIVE_PERSONA,
+                                        tools=[], model="deepseek-v3.1")},
+                                    env={k: "" for k in set(os.environ) | {"OUT_IN_API_KEY", "OUT_IN_MYINVOIS_CLIENT_ID", "OUT_IN_MYINVOIS_CLIENT_SECRET", "OUT_IN_MYINVOIS_ON_BEHALF_OF"}
+                                         if k.startswith("OUT_IN_MYINVOIS_") or k == "OUT_IN_API_KEY"},
+                                    mcp_servers={"narrative": self.server()}, persist_session=False,
+                                    request_timeout_ms=NARRATIVE_TIMEOUT_MS,
+                                    extra_args={"request-timeout-ms": str(NARRATIVE_TIMEOUT_MS)},
+                                    hooks={"PreToolUse": [HookMatcher(hooks=[self.pre_tool])]},
+                                    system_prompt=NARRATIVE_PERSONA)
+
+    async def narrate(self, evidence_paths: list[Path], expected_figures: dict):
+        self.memo = None
+        self.tool_calls = 0
+        self.expected_figures = dict(expected_figures)
+        self._register_evidence(evidence_paths)
+        prompt = ("One headless explanation event. Registered evidence IDs: "
+                  + json.dumps(list(self._evidence_text))
+                  + ". Read ALL chunks of EVERY evidence ID with read_evidence_chunk before submitting. "
+                  "Start offset=0, limit=16000; follow next_offset until complete=true. "
+                  "Then submit one plain-language decision memo with submit_decision_memo, schema: "
+                  + json.dumps({"headline": "string <= 300 chars", "summary": "string <= 4000 chars",
+                                "reasons": ["1..12 strings <= 600 chars"], "next_steps": ["0..8 strings <= 400 chars"],
+                                "figures": {key: "copy this exact string verbatim" for key in sorted(self.expected_figures)}})
+                  + ". The figures object must contain exactly these keys with the exact evidence values. "
+                  "Never alter, compute or invent any number, and never make an approval or settlement call.")
+        success = False
+        try:
+            async with asyncio.timeout(NARRATIVE_TIMEOUT_MS / 1000):
+                async with CodeBuddySDKClient(options=self.options()) as client:
+                    await client.query(prompt)
+                    async for msg in client.receive_response():
+                        if isinstance(msg, ErrorMessage):
+                            raise EvidenceError("SDK narrative failed; check runtime/model authorization")
+                        if isinstance(msg, ResultMessage):
+                            if msg.subtype != "success" or msg.is_error is not False or msg.errors:
+                                raise EvidenceError("SDK narrative did not terminate successfully")
+                            success = True
+            if not success or self.memo is None:
+                raise EvidenceError("SDK returned no successfully completed narrative memo")
+            return self.memo
+        except (CodeBuddySDKError, TimeoutError) as exc:
+            self.memo = None
+            raise EvidenceError("SDK narrative failed or timed out") from exc
+        except BaseException:
+            self.memo = None
             raise
