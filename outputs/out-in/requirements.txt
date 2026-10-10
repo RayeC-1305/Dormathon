@@ -1,4 +1,4 @@
-# Exact top-level versions validated on Python 3.13.14; regenerate demo models after changes.
+# Exact top-level versions validated on Python 3.13.16; regenerate demo models after changes.
 codebuddy-agent-sdk==0.3.274
 fastapi==0.143.0
 uvicorn[standard]==0.54.0

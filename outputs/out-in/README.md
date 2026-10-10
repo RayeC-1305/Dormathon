@@ -4,11 +4,11 @@ A single-owner SME invoice-underwriting workbench with a React operations consol
 
 **Settlement, wallet entries, contracts and legal attestations are demonstration-only in every mode. No real funds are moved.** `live` enables SDK extraction and non-demo models; it does not enable real financing. This is not a certified, production-ready, multi-tenant or independently anchored audit system. Cross-border FX, production payments and identity-backed legal signing are not implemented.
 
-This README describes **`outputs/out-in`**, the actual application in the Dormathon repository. `out-in-sdk-starter` is an older React/Express chat reference, not this service. Detailed interfaces and adapter contracts are in [INTEGRATION.md](INTEGRATION.md).
+This README describes **`outputs/out-in`**, the actual application in the Dormathon repository. `out-in-sdk-starter` is an older React/Express chat reference, not this service. Detailed interfaces and adapter contracts are in [INTEGRATION.md](INTEGRATION.md). The Dormathon pitch script and criterion-by-criterion rubric alignment map are in [PITCH.md](PITCH.md).
 
 ## Quick start: directly copyable Windows deployment
 
-Use a normal-user **Windows PowerShell 5.1** terminal, a trusted checkout, **Python 3.13**, and **Node 22.20+ within 22.x** with `npm.cmd` on PATH. The reviewed local runtimes report Python 3.13.14 and Node 22.22.2; other Python minor versions are not claimed as verified. Internet access is needed for initial package installation.
+Use a normal-user **Windows PowerShell 5.1** terminal, a trusted checkout, **Python 3.13**, and **Node 22.20+ within 22.x** with `npm.cmd` on PATH. The reviewed local runtimes report Python 3.13.16 and Node 22.22.2; other Python minor versions are not claimed as verified. Internet access is needed for initial package installation.
 
 From the **Dormathon repository root**, copy and run:
 
@@ -56,11 +56,12 @@ Stop with **Ctrl+C** after active jobs finish. The script is a local demo launch
 ```text
 outputs/out-in/
   README.md / INTEGRATION.md       Scope, setup, interfaces and limitations
+  PITCH.md                         Dormathon pitch script and rubric alignment map
   requirements.txt / .gitignore    Top-level Python pins; source hygiene
   agent_service/
     app.py                        Intake/auth/REST/WS/SPA serving
     orchestrator.py               Four-stage scheduler, retries and state
-    sdk_runtime.py                Native SDK extraction and application hooks
+    sdk_runtime.py                Native SDK extraction/narrative and application hooks
     store.py                      SQLite jobs/events/simulated wallet/recovery
     myinvois_client.py             Fixed-host read-only OAuth/raw transport
   tools/
@@ -68,6 +69,8 @@ outputs/out-in/
     reconciliation_tool.py        Authoritative exact Decimal audit/bank reader
     ml_underwrite_tool.py          Reviewed models/adapters and deterministic gates
     artifact_tool.py               Demo workbook/PDF/attestations/manifest
+    decision_memo_tool.py          Plain-language memo from deterministic evidence only
+    selfcheck_tool.py              Post-commit bundle self-verification gate
     myinvois_tool.py                Strict UBL mapping and commercial binding
   scripts/
     deploy_demo.ps1                Copy-and-run Windows demo deployment
@@ -182,7 +185,7 @@ For single-port serving, **build before backend import**: FastAPI mounts `fronte
 ## Run the synthetic demonstration
 
 1. Open Mission Control at http://127.0.0.1:8000 and enter the configured operator key.
-2. Click **Download demo dossier**. **Extract the ZIP first**; upload `invoice.pdf`, `packing_list.pdf`, and `statement.xlsx` together. ZIP intake is unsupported.
+2. Fastest path: click **Run end-to-end demo** — one action; the backend stages its generated synthetic dossier with the canonical demo terms and executes the full pipeline (`POST /api/v2/demo-run`, operator-key protected, demo mode only). Manual path instead: click **Download demo dossier**. **Extract the ZIP first**; upload `invoice.pdf`, `packing_list.pdf`, and `statement.xlsx` together. ZIP intake is unsupported.
 3. Enter these synthetic parameters:
 
    | Field | Value |
@@ -208,8 +211,22 @@ UI routes: `/` is Mission Control; `/admin/dashboard` and `/assistant` are alias
 | `reconciliation-auditor` | Scheduler-owned deterministic Python/Decimal | Exact monetary and shipping verdict |
 | `ml-risk-underwriter` | Reviewed model inference plus fixed gates | Approved **demo** limit or review proposal |
 | `settlement-legal-synthesizer` | Scheduler-owned simulation/artifact compiler | Demo wallet entry and integrity bundle |
+| `compliance-narrative-explainer` | Deterministic text always; optional bounded live SDK restatement | Advisory plain-language decision memo |
 
-Only live extraction executes an SDK agent. Python owns later calls, retries and state transitions. Terminal states are `COMPLETED`, `REVIEW_REQUIRED`, `QUARANTINED`, and `FAILED`.
+Dossier PDFs are normalized **in parallel** inside each extraction cycle. After
+risk evaluation the scheduler records a plain-language **decision memo**
+(`evidence/decision_memo.json`, also on the job record) whose figures are
+copied verbatim from deterministic evidence. In live mode, setting
+`OUT_IN_NARRATIVE_AGENT=1` lets a second bounded SDK agent restate the memo;
+its figures must exactly equal the deterministic values or the submission is
+rejected and the deterministic text stands (`narrative_source` records the
+outcome). Before a job may report `COMPLETED`, the scheduler **re-verifies the
+committed nine-file bundle and every declared source** in-process
+(`verify_bundle_integrity`, recorded in `metrics.self_check` and
+`self_check.json`); a failed self-check fails the job closed and rolls back
+the simulated wallet record. Only live extraction (and the optional narrative)
+executes an SDK agent. Python owns later calls, retries and state transitions.
+Terminal states are `COMPLETED`, `REVIEW_REQUIRED`, `QUARANTINED`, and `FAILED`.
 
 ### Bounded self-healing
 
@@ -271,6 +288,7 @@ Configuration is read from the **process environment**, not an automatically loa
 | `OUT_IN_ALLOWED_ORIGINS` | Comma-separated exact WebSocket origins; default loopback 5173/8000 variants |
 | `OUT_IN_REPO_ROOT` | Reviewed model/adapter repository; default application root |
 | `OUT_IN_OCR_ADAPTER` / `OUT_IN_OCR_ADAPTER_SHA256` | Optional reviewed, pinned OCR callable |
+| `OUT_IN_NARRATIVE_AGENT` | `1` opts in to the bounded live SDK narrative restatement of the decision memo; default off |
 | `OUT_IN_MYINVOIS_*` | Server-side opt-in read-only integration; see below |
 
 Protected HTTP endpoints require `X-API-Key` when configured. Public routes remain accessible:
@@ -280,6 +298,7 @@ Protected HTTP endpoints require `X-API-Key` when configured. Public routes rema
 | `GET /api/v2/health` | Public health, mode, `real_funds: false` |
 | `GET /api/v2/config` | Public demo/auth/integration configuration |
 | `GET /api/v2/demo-dossier` | Public generated synthetic ZIP |
+| `POST /api/v2/demo-run` | Protected one-action synthetic end-to-end run; demo mode only |
 | `POST /api/v2/underwrite/batch` | Protected multipart intake |
 | `GET /api/v2/jobs/{jid}` | Protected stored job snapshot |
 | `GET /api/v2/review-queue` | Protected review-only queue |
@@ -397,7 +416,7 @@ npm.cmd --prefix frontend run build
 
 Python-explicit Bash: `"$PYTHON" -m pytest tests -q`. A fresh standalone source copy is preferable when isolating generated test data. Do not regenerate assets while a backend is active.
 
-Historical MyInvois release baseline: **975 passing tests**—285 engine, 67 API/integration, 225 offline SDK, 193 transport, 205 parser/workflow—and a successful production frontend build. These are software tests, not proof of provider availability or model calibration. Generated JUnit/validation files are intentionally omitted from a source-only Git checkout. See the current delivery validation report for newly executed results.
+Historical MyInvois release baseline: **975 passing tests**. Current executed suite: **992 passing tests**—295 engine, 69 API/integration, 230 offline SDK, 193 transport, 205 parser/workflow—plus a successful production frontend build. These are software tests, not proof of provider availability or model calibration. Generated JUnit/validation files are intentionally omitted from a source-only Git checkout. See the current delivery validation report for newly executed results.
 
 - API tests use in-process FastAPI TestClient, synthetic PDFs/statements/models, real local reconciliation/inference/artifact generation and restricted socket access.
 - SDK tests use installed SDK types with offline substitute clients/tool handlers.
@@ -433,6 +452,38 @@ Rejected intake can remain in `incoming/`; there is no automatic retention clean
 | `FAILED` after restart | Investigate retained evidence and submit a new dossier; do not resume manually |
 | Missing manifest source | Use the complete job root for `--source-dir` |
 | No SPA on 8000 | Build `frontend/dist` before importing/starting FastAPI |
+
+## Contributing
+
+This is a competition/source checkout, not a general-purpose framework. Before
+proposing changes, read [INTEGRATION.md](INTEGRATION.md) end to end — the
+documented boundaries are deliberate, not oversights.
+
+Ground rules for any contribution:
+
+- **Determinism owns money.** Reconciliation, credit gates, limits and wallet
+  records stay in reviewed Python/`Decimal` code. LLM output is always a
+  proposal, never an authority; never let model text alter a numeric value.
+- **Fail closed.** Missing evidence, malformed input, hash/signature mismatch
+  or policy failure must reject, quarantine or fail — never default to pass.
+- **Demo stays demo.** Do not remove `is_demo` flags, simulated-settlement
+  labels or attestation disclaimers, and do not add real payment/identity
+  calls. `real_funds: false` is a hard invariant.
+- **No secrets.** Never commit keys, tokens, workspaces, SQLite databases,
+  dossiers or generated demo assets (see `.gitignore`).
+- **Tests are part of the change.** Run the full suite plus a frontend build
+  before submitting, and keep new behavior offline-testable with synthetic
+  fixtures/mocks (no network, no real provider credentials):
+
+```powershell
+& $Python scripts/prepare_demo.py
+& $Python -m pytest tests -q
+npm.cmd --prefix frontend run build
+```
+
+Style: match the surrounding code — compact stdlib-first Python with bounded
+inputs and explicit evidence errors; React hooks/components with
+backend-reported state only (the frontend never infers outcomes).
 
 ## Source publishing versus historical ZIP releases
 

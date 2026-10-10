@@ -9,20 +9,25 @@ This is a source-grounded guide to the current local service. Read [README.md](R
 ```text
 React Mission Control
   |-- multipart POST /api/v2/underwrite/batch
+  |-- one-action POST /api/v2/demo-run (synthetic dossier, demo mode)
   |-- protected REST snapshots/review/downloads
   |-- native WebSocket /api/v2/agent-stream (job-scoped token, replay cursor)
   v
 FastAPI app -> SQLite Store -> Python UnderwritingEngine
   1. trade-extraction-proposer
-       local normalization -> demo marker parser OR bounded live SDK proposal
+       local normalization (dossier PDFs in parallel)
+       -> demo marker parser OR bounded live SDK proposal
   2. reconciliation-auditor
        deterministic exact Decimal audit
        failed parity -> stages 1/2 again, at most three heals -> quarantine
   3. ml-risk-underwriter
        reviewed model inference + deterministic probability/all-in DSR/cap gates
+       + plain-language decision memo (deterministic; optional bounded live
+         SDK narrative restatement with byte-equal figure validation)
        failed risk -> read-only human review, no artifacts/wallet
   4. settlement-legal-synthesizer
-       simulated wallet preparation -> staged demo bundle -> commit simulation
+       simulated wallet preparation -> staged demo bundle
+       -> post-commit bundle self-verification -> commit simulation
 ```
 
 There are **four stages**, not an autonomous agent per tool. Registered persona names describe those roles. Only stage 1 invokes `CodeBuddySDKClient` in live mode; stages 2–4 are scheduler-owned Python calls. `Task`/`Agent` delegation is disallowed. The extraction agent cannot choose a later stage, approve a limit, settle a wallet, or compile the final agreement.
@@ -57,6 +62,7 @@ Line numbers identify the inspected source snapshot and can shift after future e
 | `OUT_IN_REPO_ROOT` | Application root | Reviewed `ml/` assets and preferred reference template repository |
 | `OUT_IN_OCR_ADAPTER` | Unset | Explicit reviewed Python OCR bridge file |
 | `OUT_IN_OCR_ADAPTER_SHA256` | Required if adapter set | Exact SHA-256 of that reviewed adapter |
+| `OUT_IN_NARRATIVE_AGENT` | Unset (off) | `1` in live mode enables the bounded SDK narrative restatement of the decision memo |
 
 Default origins:
 
@@ -105,6 +111,7 @@ For one port, `frontend/dist` must exist before backend import; Python serves it
 | `GET /api/v2/config` | Public | `mode`, `api_key_required`, `settlement: "simulated_only"`, `is_demo: true` |
 | `GET /api/v2/health` | Public | `status: "ok"`, `mode`, `real_funds: false`; not a live-model readiness check |
 | `POST /api/v2/underwrite/batch` | Operator key when configured | Multipart dossier and loan terms; returns 202 with job/token/state |
+| `POST /api/v2/demo-run` | Operator key when configured | One-action synthetic end-to-end run; demo mode only, canonical terms; returns 202 with job/token/state |
 | `GET /api/v2/jobs/{jid}` | Operator key when configured | Job snapshot excluding `sources` and `terms` |
 | `GET /api/v2/review-queue` | Operator key when configured | `{ "jobs": [...] }` for `REVIEW_REQUIRED`; currently filters the newest 200 jobs |
 | `GET /api/v2/jobs/{jid}/artifacts/{name}` | Operator key when configured | Published named artifact only; completed bundle or quarantined variance report |
@@ -419,6 +426,25 @@ async with asyncio.timeout(180):
 
 Acceptance additionally requires a successfully completed structured proposal, no rollback flag, and no timeout/SDK error. A proposal submitted before a later failed terminal message is not accepted. Exceptions clear the stored proposal. No assistant prose/reasoning is emitted to Mission Control.
 
+### Optional narrative explainer agent
+
+With `OUT_IN_NARRATIVE_AGENT=1` in live mode, a second bounded SDK session
+(`NarrativeRuntime`, persona `compliance-narrative-explainer`, separate
+`narrative` MCP server) restates the deterministic decision memo in plain
+language after risk evaluation. Its allowlist contains only
+`mcp__narrative__read_evidence_chunk` and
+`mcp__narrative__submit_decision_memo`; raw `Read`, shell, writes, web,
+delegation and every `mcp__underwriting__*` tool are blocked. It receives
+snapshotted finalized evidence JSON (`audit-N.json`, `features.json`,
+`risk.json`) with a 120-second bound, 8 turns and a chunk-count tool budget.
+The submitted memo's `figures` object must **exactly equal** the scheduler's
+deterministic evidence figures — same keys, same strings — or it is rejected.
+On any SDK/validation failure the deterministic memo stands and
+`narrative_source` records `deterministic_fallback` (`sdk_agent` on success,
+`deterministic` when the option is off or in demo mode). The memo is advisory:
+the audit and gates remain the sole authorities, and the memo JSON itself is
+hash-pinned into the completed bundle as `evidence/decision_memo.json`.
+
 ### Evidence, proposal, and hook constraints
 
 - Registered evidence is current JSON under `<job>/normalized/`. `Read` must resolve to an authorized registered path; no arbitrary filesystem read is intended.
@@ -687,6 +713,21 @@ The scheduler rechecks parity and source hashes before settlement. Wallet operat
 
 `build_artifacts` validates inputs, writes into a unique job `staging/` directory, finalizes PDF/workbook, hashes/signs complete payloads, and renames the finished directory to `artifacts/`. Existing artifacts are never overwritten; failed staging is retained. Filesystem rename, SQLite wallet changes, and job state transitions are not one distributed atomic transaction. HTTP ordinary artifact access requires a published name and `COMPLETED` state, so a retained staged/failed bundle is not automatically a committed downloadable result.
 
+### Post-commit self-verification
+
+After the rename, the scheduler runs `verify_bundle_integrity`
+(`tools/selfcheck_tool.py`), which loads the reviewed standalone
+`scripts/verify_manifest.py` logic in-process and re-verifies the exact
+committed bundle — inventory, seven payload hashes, canonical manifest
+signature, distinct keys, both role attestations and every declared source
+against the job root. The result is written to `<job>/self_check.json`, merged
+into `metrics.self_check`, emitted as a `METRICS` event and displayed as the
+frontend SELF-CHECK VERIFIED chip. A failed self-check raises `EvidenceError`:
+the job fails closed, the simulated wallet rolls back, and the unverifiable
+bundle never reaches a downloadable state. This is built-in quality control,
+not a replacement for independent offline verification with
+`--trusted-key-dir`.
+
 ### Nine-file bundle
 
 ```text
@@ -774,9 +815,9 @@ From application root:
 pytest tests -q
 ```
 
-Use the interpreter-explicit form in README to select the confirmed environment. Inspected managed runtime is **Python 3.13.14**, with all 17 top-level requirements matching installed metadata; recommended frontend runtime is Node 22 (inspected `v22.22.2`). The requirements file records the inspected version.
+Use the interpreter-explicit form in README to select the confirmed environment. Inspected managed runtime is **Python 3.13.16**, with all 17 top-level requirements matching installed metadata; recommended frontend runtime is Node 22 (inspected `v22.22.2`). The requirements file records the inspected version.
 
-The baseline had 558 passing cases. MyInvois coverage expands the suite to 975 cases across five files (285 engine, 67 API, 225 offline SDK, 193 client transport, 205 structured-invoice/workflow), including a terminal-state/event race regression. Final executed counts and timing are recorded in `demo/test-results.xml` and `demo/validation_results.json`; transport is synthetic and authenticated LHDN execution remains unverified. Vite 6.0.5 production build passed with 1,588 transformed modules. `demo/test-results.xml` and `demo/validation_results.json` record release evidence. API integration runs real local demo stages, while SDK tests use mocked transports; no authenticated provider inference or real funds were verified. Full Chromium upload-to-vault/theme validation remains incomplete after automation navigation timeout; final browser and owned worker cleanup succeeded. The source ZIP includes a fresh SPA build and excludes dependencies/private workspace files. A separate synthetic evidence ZIP includes the nine-file bundle plus every declared source for independent byte/signature/source verification; see README for portable launch and verification paths.
+The baseline had 558 passing cases. MyInvois coverage expanded the suite to 975 cases; the decision-memo, narrative-agent, self-check and one-action demo-run additions bring the current executed total to **992 passing cases** across five files (295 engine, 69 API, 230 offline SDK, 193 client transport, 205 structured-invoice/workflow), including a terminal-state/event race regression. Final executed counts and timing are recorded in `demo/test-results.xml` and `demo/validation_results.json`; transport is synthetic and authenticated LHDN execution remains unverified. Vite 6.0.5 production build passed with 1,588 transformed modules. `demo/test-results.xml` and `demo/validation_results.json` record release evidence. API integration runs real local demo stages, while SDK tests use mocked transports; no authenticated provider inference or real funds were verified. Full Chromium upload-to-vault/theme validation remains incomplete after automation navigation timeout; final browser and owned worker cleanup succeeded. The source ZIP includes a fresh SPA build and excludes dependencies/private workspace files. A separate synthetic evidence ZIP includes the nine-file bundle plus every declared source for independent byte/signature/source verification; see README for portable launch and verification paths.
 
 The five test files cover synthetic REST/WS completion/review/quarantine, numerical and artifact/tamper contracts, original-schema adapters with controlled fixtures, native SDK options/messages/MCP/hooks, and timeout/failure behavior. Offline substitute SDK clients do not establish provider readiness. Synthetic models and dossiers do not validate real lending performance.
 
