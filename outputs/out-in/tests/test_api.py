@@ -266,9 +266,20 @@ def test_real_upload_async_completion_and_scoped_terminal_events(api, completed)
     tools = Counter(event["payload"]["tool"] for event in completed.events
                     if event["type"] == "TOOL_EXECUTION" and event["payload"]["status"] == "COMPLETED")
     assert tools == {"run_ocr_normalizer": 2, "run_excel_reconciliation": 1,
-                     "evaluate_credit_ml": 1, "compile_tnc_agreement": 1}
+                     "evaluate_credit_ml": 1, "compile_tnc_agreement": 1, "verify_bundle_integrity": 1}
     assert "sources" not in completed.job and "terms" not in completed.job
     assert completed.accepted["stream_token"] not in json.dumps(completed.job)
+    memo = completed.job["decision_memo"]
+    assert memo["is_demo"] is True and memo["outcome"] == "APPROVED"
+    assert memo["narrative_source"] == "deterministic"
+    assert Decimal(memo["figures"]["approved_limit"]) == Decimal("40000.00")
+    assert Decimal(memo["figures"]["invoice_total"]) == Decimal("100000.00")
+    assert json.loads((completed.directory / "evidence" / "decision_memo.json").read_text(encoding="utf-8")) == memo
+    self_check = completed.job["metrics"]["self_check"]
+    assert self_check["verified"] is True and self_check["self_check"] == "post_commit"
+    assert self_check["outputs_checked"] == 7 and self_check["sources_checked"] >= 9
+    assert self_check["real_funds"] is False and self_check["is_demo"] is True
+    assert json.loads((completed.directory / "self_check.json").read_text(encoding="utf-8")) == self_check
 
 
 @pytest.fixture(scope="module")
@@ -638,3 +649,29 @@ def test_myinvois_unknown_sources_and_tampering_fail_closed(api, synthetic_myinv
             assert declared["sha256"] == hashlib.sha256(original).hexdigest()
         finally:
             path.write_bytes(original)
+
+
+def test_demo_run_requires_operator_key(api):
+    assert api.client.post("/api/v2/demo-run").status_code == 401
+    assert api.client.post("/api/v2/demo-run", headers={"X-API-Key": "invalid-synthetic-key"}).status_code == 401
+
+
+def test_demo_run_one_action_completes_end_to_end(api):
+    response = api.client.post("/api/v2/demo-run", headers=api.headers)
+    assert response.status_code == 202, response.text
+    accepted = response.json()
+    assert accepted["state"] == "QUEUED"
+    assert len(accepted["job_id"]) == 32 and accepted["stream_token"]
+    case = await_terminal(api, accepted)
+    assert case.job["state"] == "COMPLETED", case.job
+    assert states(case) == ["QUEUED", "EXTRACTING", "RECONCILING", "UNDERWRITING", "SETTLING", "COMPLETED"]
+    assert Decimal(case.job["metrics"]["approved_limit"]) == Decimal("40000.00")
+    assert case.job["metrics"]["self_check"]["verified"] is True
+    assert case.job["decision_memo"]["outcome"] == "APPROVED"
+    assert len(case.job["artifacts"]) == 9
+    assert wallet(api, case) == [{"amount": case.job["metrics"]["approved_limit"], "status": "SIMULATED_ONLY"}]
+    # One-action intake must land exactly the three generated fixtures.
+    inputs = sorted(path.name for path in (case.directory / "inputs").iterdir())
+    assert inputs == ["invoice.pdf", "packing_list.pdf", "statement.xlsx"]
+    for name in inputs:
+        assert (case.directory / "inputs" / name).read_bytes() == api.originals[name]

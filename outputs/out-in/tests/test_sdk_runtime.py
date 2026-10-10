@@ -552,3 +552,114 @@ def test_verified_timeout_workaround_survives_sdk_transport_option_copy(case):
     assert argv.count("--request-timeout-ms") == 1
     index = argv.index("--request-timeout-ms")
     assert argv[index + 1] == str(REQUEST_TIMEOUT_MS)
+
+
+def narrative_figures():
+    return {"variance": "0", "invoice_total": "100000.00", "verified_inflow": "100000.00",
+            "default_probability": "0.05", "dsr": "0.35", "existing_dsr": "0.01",
+            "requested_limit": "40000.00", "approved_limit": "40000.00", "proposed_limit": "40000.00"}
+
+
+def narrative_memo(figures):
+    return {"headline": "Synthetic narrative headline", "summary": "Synthetic plain-language summary.",
+            "reasons": ["Synthetic reason one.", "Synthetic reason two."],
+            "next_steps": ["Synthetic next step."], "figures": figures}
+
+
+@pytest.fixture
+def narrative_case(tmp_path, monkeypatch):
+    from agent_service.sdk_runtime import NarrativeRuntime
+
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    paths = []
+    for name, packet in [("audit-0.json", {"passed": True, "variance": "0"}),
+                         ("risk.json", {"passed": True, "approved_limit": "40000.00"})]:
+        path = evidence / name
+        path.write_text(json.dumps(packet), encoding="utf-8")
+        paths.append(path)
+    runtime = NarrativeRuntime(tmp_path, Mock())
+    state = SimpleNamespace(runtime=runtime, paths=paths, figures=narrative_figures(),
+                            messages=[terminal()], submit=narrative_memo(narrative_figures()),
+                            prompt=None, options=None)
+
+    class OfflineClient:
+        def __init__(self, *, options):
+            state.options = options
+            self.tools = options.mcp_servers["narrative"]["server"].tools
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            state.prompt = prompt
+            if state.submit is not None:
+                await self.tools["submit_decision_memo"].handler(state.submit)
+
+        async def receive_response(self):
+            for message in state.messages:
+                yield message
+
+    monkeypatch.setattr(sdk_runtime, "CodeBuddySDKClient", OfflineClient)
+    return state
+
+
+def narrate(case, **kwargs):
+    return asyncio.run(case.runtime.narrate(case.paths, case.figures, **kwargs))
+
+
+def test_narrative_agent_accepts_memo_with_exact_deterministic_figures(narrative_case):
+    memo = narrate(narrative_case)
+    assert memo["figures"] == narrative_figures()
+    assert memo["headline"] == "Synthetic narrative headline"
+    assert memo["reasons"] == ["Synthetic reason one.", "Synthetic reason two."]
+    assert "read ALL chunks" in narrative_case.prompt.replace("Read ALL", "read ALL")
+    options = narrative_case.options
+    assert options.tools == [] and options.persist_session is False
+    assert set(options.allowed_tools) == {"mcp__narrative__read_evidence_chunk", "mcp__narrative__submit_decision_memo"}
+    assert "Read" in set(options.disallowed_tools)
+    assert set(options.mcp_servers) == {"narrative"}
+
+
+def test_narrative_agent_rejects_altered_figures(narrative_case):
+    narrative_case.submit = narrative_memo({**narrative_figures(), "approved_limit": "999999.00"})
+    with pytest.raises(EvidenceError):
+        narrate(narrative_case)
+    assert narrative_case.runtime.memo is None
+
+
+def test_narrative_agent_rejects_missing_figure_keys(narrative_case):
+    figures = narrative_figures()
+    del figures["dsr"]
+    narrative_case.submit = narrative_memo(figures)
+    with pytest.raises(EvidenceError):
+        narrate(narrative_case)
+    assert narrative_case.runtime.memo is None
+
+
+def test_narrative_agent_rejects_non_evidence_registration(narrative_case, tmp_path):
+    outside = tmp_path / "normalized" / "packet.json"
+    outside.parent.mkdir()
+    outside.write_text("{}", encoding="utf-8")
+    narrative_case.paths = [outside]
+    with pytest.raises(EvidenceError, match="evidence JSON"):
+        narrate(narrative_case)
+    root_file = tmp_path / "self_check.json"
+    root_file.write_text("{}", encoding="utf-8")
+    narrative_case.paths = [root_file]
+    with pytest.raises(EvidenceError, match="evidence JSON"):
+        narrate(narrative_case)
+
+
+def test_narrative_pre_tool_blocks_reads_and_later_stage_tools(narrative_case):
+    runtime = narrative_case.runtime
+    runtime._register_evidence(narrative_case.paths)
+    for name in ("Read", "Bash", "mcp__underwriting__evaluate_credit_ml", "mcp__underwriting__read_evidence_chunk"):
+        verdict = asyncio.run(runtime.pre_tool({"tool_name": name, "tool_input": {}}))
+        assert verdict["decision"] == "block", name
+    verdict = asyncio.run(runtime.pre_tool({"tool_name": "mcp__narrative__read_evidence_chunk",
+                                            "tool_input": {"evidence_id": "evidence-1", "offset": 0, "limit": 10}}))
+    assert verdict == {}

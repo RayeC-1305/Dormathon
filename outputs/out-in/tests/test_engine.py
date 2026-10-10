@@ -23,7 +23,9 @@ from agent_service import orchestrator
 from agent_service.sdk_runtime import SDKRuntime
 from agent_service.store import Store
 from tools import artifact_tool, ml_underwrite_tool
+from tools.decision_memo_tool import build_decision_memo, expected_figures
 from tools.ml_underwrite_tool import FEATURES, evaluate_credit_ml
+from tools.selfcheck_tool import verify_bundle_integrity
 from tools.reconciliation_tool import (
     EvidenceError,
     ParityViolation,
@@ -552,13 +554,17 @@ def engine_factory(tmp_path, monkeypatch):
         risk = Mock(return_value={"passed": True, "review_required": False, "approved_limit": "40000.00",
                                   "proposed_limit": "40000.00", "default_probability": "0.0"})
         artifacts = Mock(return_value=["synthetic-bundle.bin"])
+        selfcheck = Mock(return_value={"verified": True, "outputs_checked": 7, "sources_checked": 10,
+                                       "self_check": "post_commit", "is_demo": True,
+                                       "notice": "Synthetic mock; real bundles verify in integration tests"})
         monkeypatch.setattr(orchestrator, "run_ocr_normalizer", ocr)
         monkeypatch.setattr(orchestrator, "parse_demo_packet", parse)
         monkeypatch.setattr(orchestrator, "evaluate_credit_ml", risk)
         monkeypatch.setattr(orchestrator, "build_artifacts", artifacts)
+        monkeypatch.setattr(orchestrator, "verify_bundle_integrity", selfcheck)
         return SimpleNamespace(store=store, jid=jid, token=token, directory=directory, statement=statement,
                                invoice=invoice, delivery=delivery, ocr=ocr, risk=risk, artifacts=artifacts,
-                               engine=orchestrator.UnderwritingEngine(store))
+                               selfcheck=selfcheck, engine=orchestrator.UnderwritingEngine(store))
     return create
 
 
@@ -583,6 +589,7 @@ def test_engine_quarantines_after_exactly_three_self_heals_without_underwriting_
     assert report["passed"] is False
     case.risk.assert_not_called()
     case.artifacts.assert_not_called()
+    case.selfcheck.assert_not_called()
     assert wallet_row(case.store, case.jid) is None
     assert not (case.directory / "artifacts").exists()
 
@@ -609,6 +616,7 @@ def test_engine_successful_self_heal_stops_at_first_exact_audit(engine_factory, 
     assert Decimal(case.store.get(case.jid)["metrics"]["variance"]) == 0
     case.risk.assert_called_once()
     case.artifacts.assert_called_once()
+    case.selfcheck.assert_called_once()
     assert wallet_row(case.store, case.jid) == {"amount": "40000.00", "status": "SIMULATED_ONLY"}
 
 
@@ -621,7 +629,10 @@ def test_engine_risk_review_never_compiles_artifacts_or_prepares_wallet(engine_f
     assert job["state"] == "REVIEW_REQUIRED"
     assert job["metrics"]["approved_limit"] == "0.00"
     assert job["artifacts"] == []
+    assert job["decision_memo"]["outcome"] == "REVIEW_REQUIRED"
+    assert job["decision_memo"]["is_demo"] is True
     case.artifacts.assert_not_called()
+    case.selfcheck.assert_not_called()
     assert wallet_row(case.store, case.jid) is None
     assert not (case.directory / "artifacts").exists()
 
@@ -1352,3 +1363,115 @@ def test_exported_untrusted_invoice_ids_remain_literal_not_spreadsheet_formulas(
         assert json.loads(audit_text)["invoices"][0]["invoice_id"] == identifier
     finally:
         book.close()
+
+
+def synthetic_risk(passed=True):
+    base = {"passed": passed, "review_required": not passed, "default_probability": "0.05",
+            "dsr": "0.35", "existing_dsr": "0.01", "financing_ceiling": "65000.00",
+            "requested_limit": "40000.00", "approved_limit": "40000.00" if passed else "0.00",
+            "proposed_limit": "40000.00" if passed else "20000.00",
+            "haircut_requested_limit": None if passed else "20000.00",
+            "gates": {"probability_le_0_12": True, "all_in_dsr_le_0_45": passed},
+            "is_demo_model": True}
+    if not passed:
+        base["gates"]["all_in_dsr_le_0_45"] = False
+    return base
+
+
+def test_decision_memo_copies_verbatim_figures_and_explains_approval(valid_report):
+    risk = synthetic_risk(passed=True)
+    terms = {"requested_limit": "40000.00"}
+    memo = build_decision_memo(valid_report, risk, terms)
+    assert memo["is_demo"] is True and memo["outcome"] == "APPROVED"
+    assert memo["narrative_source"] == "deterministic"
+    figures = expected_figures(valid_report, risk, terms)
+    assert memo["figures"] == figures
+    assert figures["variance"] == valid_report["variance"]
+    assert figures["invoice_total"] == valid_report["invoice_total"]
+    assert figures["verified_inflow"] == valid_report["verified_inflow"]
+    assert figures["approved_limit"] == "40000.00" and figures["default_probability"] == "0.05"
+    assert memo["reasons"] and any("0.12" in reason for reason in memo["reasons"])
+    assert any("0.45" in reason for reason in memo["reasons"])
+    assert "no financing authority" in memo["authority"]
+    assert json.dumps(memo, allow_nan=False)
+
+
+def test_decision_memo_review_path_records_bounded_proposal_not_approval(valid_report):
+    risk = synthetic_risk(passed=False)
+    memo = build_decision_memo(valid_report, risk, {"requested_limit": "40000.00"})
+    assert memo["outcome"] == "REVIEW_REQUIRED"
+    assert memo["figures"]["approved_limit"] == "0.00"
+    assert memo["figures"]["proposed_limit"] == "20000.00"
+    assert any("never an approval" in reason for reason in memo["reasons"])
+    assert any("review" in step.lower() for step in memo["next_steps"])
+
+
+def test_decision_memo_tolerates_partial_risk_evidence_without_inventing_figures(valid_report):
+    risk = {"passed": True, "approved_limit": "40000.00", "proposed_limit": "40000.00"}
+    memo = build_decision_memo(valid_report, risk, {"requested_limit": "40000.00"})
+    assert "dsr" not in memo["figures"] and "default_probability" not in memo["figures"]
+    assert memo["reasons"]
+
+
+def test_decision_memo_rejects_narrative_with_altered_figures(valid_report):
+    risk = synthetic_risk(passed=True)
+    terms = {"requested_limit": "40000.00"}
+    figures = expected_figures(valid_report, risk, terms)
+    narrative = {"headline": "Synthetic altered narrative", "summary": "Tampered figure attempt.",
+                 "reasons": ["Synthetic reason"], "next_steps": [],
+                 "figures": {**figures, "approved_limit": "999999.00"}}
+    with pytest.raises(EvidenceError, match="figures differ"):
+        build_decision_memo(valid_report, risk, terms, narrative=narrative, narrative_source="sdk_agent")
+
+
+def test_decision_memo_accepts_narrative_with_exact_figures(valid_report):
+    risk = synthetic_risk(passed=True)
+    terms = {"requested_limit": "40000.00"}
+    figures = expected_figures(valid_report, risk, terms)
+    narrative = {"headline": "Synthetic plain-language headline", "summary": "Synthetic summary.",
+                 "reasons": ["Synthetic reason one."], "next_steps": ["Synthetic step."],
+                 "figures": figures}
+    memo = build_decision_memo(valid_report, risk, terms, narrative=narrative, narrative_source="sdk_agent")
+    assert memo["headline"] == "Synthetic plain-language headline"
+    assert memo["figures"] == figures and memo["narrative_source"] == "sdk_agent"
+
+
+def test_decision_memo_rejects_invalid_evidence_figure(valid_report):
+    risk = synthetic_risk(passed=True)
+    risk["default_probability"] = 0.05  # Binary float, not an evidence string.
+    with pytest.raises(EvidenceError):
+        build_decision_memo(valid_report, risk, {"requested_limit": "40000.00"})
+
+
+def test_decision_memo_accepts_long_decimal_and_scientific_evidence_strings(valid_report):
+    risk = synthetic_risk(passed=True)
+    risk["default_probability"] = "0.041666666666666664"
+    risk["dsr"] = "0.3433333333333333333333333333"
+    memo = build_decision_memo(valid_report, risk, {"requested_limit": "40000.00"})
+    assert memo["figures"]["default_probability"] == "0.041666666666666664"
+    assert memo["figures"]["dsr"] == "0.3433333333333333333333333333"
+
+
+def test_bundle_selfcheck_verifies_real_committed_bundle(signed_bundle):
+    job, bundle, names = signed_bundle
+    result = verify_bundle_integrity(job)
+    assert result["verified"] is True and result["self_check"] == "post_commit"
+    assert result["outputs_checked"] == 7 and result["sources_checked"] == 1
+    assert result["real_funds"] is False and result["is_demo"] is True
+
+
+def test_bundle_selfcheck_fails_closed_on_tampered_bundle(signed_bundle):
+    job, bundle, names = signed_bundle
+    pdf = bundle / "Out_In_TNC_Agreement.pdf"
+    original = pdf.read_bytes()
+    try:
+        pdf.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        with pytest.raises(EvidenceError, match="self-verification"):
+            verify_bundle_integrity(job)
+    finally:
+        pdf.write_bytes(original)
+
+
+def test_bundle_selfcheck_fails_closed_when_bundle_missing(tmp_path):
+    with pytest.raises(EvidenceError, match="missing"):
+        verify_bundle_integrity(tmp_path / "synthetic-job")
