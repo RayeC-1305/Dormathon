@@ -18,7 +18,10 @@ workspace/
 *.sqlite3-*
 # Local agent workspace metadata
 .workbuddy-ai/
-# Generated demo/validation artifacts and release archives
+# Generated demo/validation artifacts, release archives and local scratch
 outputs/out-in/demo/
 outputs/*.zip
+outputs/OUT_IN_Release_Checksums*.json
 outputs/out-in-*-validation-*/
+outputs/sdk-reference/
+/package-lock.json
