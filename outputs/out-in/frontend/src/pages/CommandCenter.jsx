@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, ArrowDownToLine, ArrowRight, ArrowUpRight, Check, ChevronDown, Circle, Clock3, FileText, FolderLock, History, LoaderCircle, Play, RefreshCw, RotateCcw, ScanLine, ShieldCheck, UploadCloud, X } from 'lucide-react';
 import { useOperator } from '../App.jsx';
-import { DEMO_DOSSIER_URL, downloadBlob, submitBatch } from '../api.js';
+import { DEMO_DOSSIER_URL, downloadBlob, runDemo, submitBatch } from '../api.js';
 import { ArtifactButton, Notice, RiskGauge, StateBadge } from '../components.jsx';
 import useAgentStream from '../hooks/useAgentStream.js';
 import { artifactsOf, isQuarantined, isTerminal, isVarianceReport, money, normalizeState, numberOrNull, percent, redact, varianceStatus } from '../model.js';
@@ -12,10 +12,10 @@ const MAX_FILES = 20;
 const MAX_FILE_SIZE = 20 * MIB;
 const MAX_TOTAL_SIZE = 50 * MIB;
 const STAGES = [
-  { title: 'Evidence intake', caption: 'Extract & normalize', icon: FileText, match: /ingest|intake|extract|parse|document|upload/i },
+  { title: 'Evidence intake', caption: 'Parallel extract & normalize', icon: FileText, match: /ingest|intake|extract|parse|document|upload/i },
   { title: 'Reconciliation', caption: 'Verify every number', icon: ScanLine, match: /reconcil|variance|audit|verif/i },
   { title: 'Risk assessment', caption: 'Model credit exposure', icon: ShieldCheck, match: /risk|score|underwrit|assess/i },
-  { title: 'Decision package', caption: 'Seal the evidence', icon: FolderLock, match: /decision|package|artifact|report|finaliz|complet/i },
+  { title: 'Decision package', caption: 'Seal & self-verify evidence', icon: FolderLock, match: /decision|package|artifact|report|finaliz|complet/i },
 ];
 
 function stageFor(text) {
@@ -55,7 +55,29 @@ function Dag({ job, events }) {
         <svg viewBox="0 0 800 40" preserveAspectRatio="none" aria-hidden="true"><path d="M700 0 V22 Q700 32 690 32 H310 Q300 32 300 22 V8" /><path d="M294 15 L300 8 L306 15" /></svg>
         <span><RotateCcw size={12} />{rollback ? `ROLLBACK CYCLE ${rollback.cycle ?? 'NOT REPORTED'} · RECONCILIATION RECHECK` : 'VARIANCE DETECTED → RETURN TO RECONCILIATION'}</span>
       </div>
-      <div className="pipeline-footnote"><span className="status-dot" />Stage activity is mapped from backend state, agent and tool events. Unknown stages remain unverified.</div>
+      <div className="pipeline-footnote"><span className="status-dot" />Stage activity is mapped from backend state, agent and tool events. Dossier PDFs normalize in parallel; committed bundles are self-verified before COMPLETED. Unknown stages remain unverified.</div>
+    </section>
+  );
+}
+
+const NARRATIVE_SOURCES = {
+  deterministic: 'DETERMINISTIC EXPLAINER',
+  sdk_agent: 'WORKBUDDY NARRATIVE AGENT',
+  deterministic_fallback: 'DETERMINISTIC FALLBACK',
+};
+
+function DecisionMemo({ memo }) {
+  if (!memo || typeof memo.headline !== 'string') return null;
+  const reasons = Array.isArray(memo.reasons) ? memo.reasons.filter((r) => typeof r === 'string') : [];
+  const steps = Array.isArray(memo.next_steps) ? memo.next_steps.filter((s) => typeof s === 'string') : [];
+  const source = NARRATIVE_SOURCES[memo.narrative_source] || 'SOURCE NOT REPORTED';
+  return (
+    <section className="panel memo-panel" aria-labelledby="memo-title">
+      <div className="panel-heading"><div><span className="eyebrow">PLAIN-LANGUAGE DECISION MEMO</span><h2 id="memo-title">{memo.headline}</h2></div><span className="subtle-chip"><FileText size={13} />{source}</span></div>
+      <p className="memo-summary">{typeof memo.summary === 'string' ? memo.summary : ''}</p>
+      {reasons.length > 0 && <ol className="memo-list">{reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ol>}
+      {steps.length > 0 && <div className="memo-steps"><span className="eyebrow">NEXT STEPS</span><ul className="memo-list">{steps.map((step, index) => <li key={index}>{step}</li>)}</ul></div>}
+      <p className="metric-note">{memo.authority || 'Deterministic gates decide outcomes.'} {memo.disclaimer || ''}</p>
     </section>
   );
 }
@@ -92,6 +114,7 @@ export default function CommandCenter() {
   const [dragging, setDragging] = useState(false);
   const [demoBusy, setDemoBusy] = useState(false);
   const [demoError, setDemoError] = useState('');
+  const [demoRunBusy, setDemoRunBusy] = useState(false);
   const fileInput = useRef(null);
   const submission = useRef(null);
   const submitLock = useRef(false);
@@ -176,11 +199,30 @@ export default function CommandCenter() {
     finally { if (mounted.current) setDemoBusy(false); }
   }
 
+  async function executeDemo() {
+    if (demoRunBusy || busy || keyMissing) return;
+    setDemoRunBusy(true);
+    setDemoError('');
+    try {
+      const response = await runDemo(apiKey);
+      if (!response || typeof response.job_id !== 'string' || !response.job_id ||
+        typeof response.stream_token !== 'string' || !response.stream_token) {
+        throw new Error('The backend did not return a valid job id and stream token.');
+      }
+      if (mounted.current) rememberRun(response);
+    } catch (reason) {
+      if (mounted.current) setDemoError(reason.message);
+    } finally { if (mounted.current) setDemoRunBusy(false); }
+  }
+
   return (
     <main className="main-content">
       <section className="page-heading">
         <div><span className="eyebrow">OUT&IN / CREDIT INTELLIGENCE</span><h1>Mission control<span className="heading-dot">.</span></h1><p>From financial evidence to a defensible credit decision.</p></div>
-        <button type="button" className="secondary-button dossier-button" onClick={downloadDemo} disabled={demoBusy}>{demoBusy ? <LoaderCircle size={16} className="spin" /> : <ArrowDownToLine size={16} />}Download demo dossier<ArrowUpRight size={14} /></button>
+        <div className="heading-actions">
+          <button type="button" className="secondary-button dossier-button" onClick={downloadDemo} disabled={demoBusy}>{demoBusy ? <LoaderCircle size={16} className="spin" /> : <ArrowDownToLine size={16} />}Download demo dossier<ArrowUpRight size={14} /></button>
+          <button type="button" className="secondary-button dossier-button" onClick={executeDemo} disabled={demoRunBusy || busy || keyMissing || config?.mode !== 'demo'} title="One action: the backend stages its synthetic dossier with canonical demo terms and runs the full pipeline.">{demoRunBusy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} fill="currentColor" />}Run end-to-end demo<ArrowRight size={14} /></button>
+        </div>
       </section>
       {configError && <Notice action={<button className="text-button" onClick={retryConfig}>Retry configuration</button>}>{configError}</Notice>}
       {demoError && <Notice>{demoError}</Notice>}
@@ -229,6 +271,7 @@ export default function CommandCenter() {
             <div className="panel risk-panel"><div className="risk-heading"><span className="eyebrow">CREDIT RISK</span><ShieldCheck size={17} className="muted" /></div><RiskGauge probability={metrics.default_probability} /></div>
           </section>
           <section className="panel decision-strip" aria-label="Reported credit limits"><div><span className="eyebrow">DEBT SERVICE RATIO</span><strong>{dsr === null || dsr < 0 ? 'Not reported' : percent(dsr)}</strong><small>Backend-reported ratio</small></div><div><span className="eyebrow">PROPOSED LIMIT</span><strong>{money(metrics.proposed_limit)}</strong><small>Proposal only · not approval</small></div><div><span className="eyebrow">APPROVED LIMIT</span><strong>{money(metrics.approved_limit)}</strong><small>Backend-reported · no disbursement</small></div></section>
+          <DecisionMemo memo={job?.decision_memo} />
           <div className="stream-status" aria-live="polite"><span className="status-dot" /><span>{connection.status.replaceAll('-', ' ').toUpperCase()}{connection.delay ? ` · RETRY ${connection.attempts}/6 IN ${connection.delay / 1000}s` : ''}</span><span className="mono">SEQ {sequence}</span>{selectedRun && <button className="text-button" onClick={reconnect}>Reconnect<RefreshCw size={12} /></button>}</div>
           {error && <Notice action={<button className="text-button" onClick={refresh}>Refresh snapshot</button>}>{error}</Notice>}
           {job?.error && <Notice>{redact(job.error, apiKey)}</Notice>}
@@ -237,7 +280,7 @@ export default function CommandCenter() {
 
       {quarantined && <section className="panel quarantine-panel"><div className="panel-heading"><div><span className="eyebrow warning">QUARANTINE / HUMAN OVERSIGHT</span><h2>Evidence held for review.</h2></div><StateBadge state={job?.state} /></div><p>Decision artifacts remain locked. Reconciliation quarantine prohibits underwriting and settlement; no automatic haircut is offered. Review the variance report and retained source evidence without altering values to force parity.</p>{varianceReports.length > 0 ? varianceReports.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />) : <div className="empty-inline">No quarantine variance report has been returned.</div>}<Link className="text-link" to="/admin/review">Open the human review queue<ArrowUpRight size={15} /></Link></section>}
       {job?.myinvois_sources?.length > 0 && <section className="panel"><div className="panel-heading"><h2>LHDN source snapshots</h2></div><p className="metric-note">Authenticated API response snapshots, not continuous status assurance or independent verification of LHDN signatures. Sensitive invoice data: authorized operator downloads only.</p>{job.myinvois_sources.map((source) => <ArtifactButton key={source.name} artifact={{ name: source.name, url: `/api/v2/jobs/${job.id}/myinvois-sources/${encodeURIComponent(source.name.split('/').pop())}` }} apiKey={apiKey} />)}</section>}
-      {completed && <section className="panel vault-panel"><div className="panel-heading"><div><span className="eyebrow">SEALED / COMPLETED RUN</span><h2>Artifact vault</h2></div><span className="subtle-chip"><FolderLock size={13} />{vaultArtifacts.length} ARTIFACTS</span></div><p className="metric-note">Available only after the backend reports COMPLETED. Downloads use your in-memory API key.</p>{vaultArtifacts.length > 0 ? vaultArtifacts.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />) : <div className="empty-inline">The completed snapshot contains no decision artifacts.</div>}{varianceReports.length > 0 && <details className="reconciliation-reports"><summary>Reconciliation reports<ChevronDown size={15} /></summary>{varianceReports.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />)}</details>}</section>}
+      {completed && <section className="panel vault-panel"><div className="panel-heading"><div><span className="eyebrow">SEALED / COMPLETED RUN</span><h2>Artifact vault</h2></div><div className="heading-actions"><span className="subtle-chip"><FolderLock size={13} />{vaultArtifacts.length} ARTIFACTS</span>{metrics.self_check?.verified === true && <span className="subtle-chip self-check-chip"><ShieldCheck size={13} />SELF-CHECK VERIFIED</span>}</div></div><p className="metric-note">Available only after the backend reports COMPLETED. Downloads use your in-memory API key.{metrics.self_check?.verified === true ? ` The backend re-verified the committed bundle itself: ${metrics.self_check.outputs_checked ?? '?'} payload hashes, 3 Ed25519 signatures and ${metrics.self_check.sources_checked ?? '?'} declared sources checked.` : ''}</p>{vaultArtifacts.length > 0 ? vaultArtifacts.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />) : <div className="empty-inline">The completed snapshot contains no decision artifacts.</div>}{varianceReports.length > 0 && <details className="reconciliation-reports"><summary>Reconciliation reports<ChevronDown size={15} /></summary>{varianceReports.map((artifact) => <ArtifactButton key={artifact.url} artifact={artifact} apiKey={apiKey} />)}</details>}</section>}
       {!completed && !quarantined && <div className="vault-locked"><FolderLock size={15} /><span>Decision artifacts are locked until the run reaches COMPLETED.</span></div>}
       <Telemetry events={events} sequence={sequence} apiKey={apiKey} />
       <section className="panel history-panel"><div className="panel-heading"><div><span className="eyebrow">THIS BROWSER SESSION</span><h2><History size={18} />Run history</h2></div><span className="muted small">IDs & tokens only · {history.length} / 20</span></div>{history.length === 0 ? <div className="empty-inline"><Clock3 size={17} />Completed and active run IDs will appear here after execution. No metrics or API keys are stored.</div> : <ul className="history-list">{history.map((run, index) => <li key={run.job_id}><button disabled={submitting} className={run.job_id === selectedRun?.job_id ? 'selected' : ''} onClick={() => setSelectedRun(run)}><span className="history-number">{String(index + 1).padStart(2, '0')}</span><span className="mono">{run.job_id}</span><span className="history-action">{run.job_id === selectedRun?.job_id ? 'MONITORING' : 'OPEN RUN'}<ArrowUpRight size={14} /></span></button></li>)}</ul>}</section>

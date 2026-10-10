@@ -37,6 +37,12 @@ export function submitBatch(files, terms, apiKey, signal) {
   return requestJson('/underwrite/batch', { method: 'POST', body, apiKey, signal });
 }
 
+// One action, end-to-end: the backend stages its generated synthetic dossier
+// with the canonical demo terms. No files or credentials leave the browser.
+export function runDemo(apiKey, signal) {
+  return requestJson('/demo-run', { method: 'POST', apiKey, signal });
+}
+
 export async function downloadBlob(path, filename, apiKey = '', signal) {
   const url = new URL(path, window.location.origin);
   // Protected artifact URLs must stay same-origin so the key cannot leak to a host

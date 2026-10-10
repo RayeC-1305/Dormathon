@@ -527,3 +527,19 @@ svg { flex-shrink: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* Plain-language decision memo and one-action demo run */
+.heading-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.memo-panel { margin-top: 18px; }
+.memo-panel .panel-heading { margin-bottom: 14px; }
+.memo-panel h2 { font-size: 17px; letter-spacing: -0.4px; line-height: 1.35; }
+.memo-summary { font-size: 11px; line-height: 1.8; color: var(--text); margin: 0 0 14px; }
+.memo-list { margin: 0; padding-left: 22px; font-size: 10px; line-height: 1.8; color: var(--muted); }
+.memo-list li { margin-bottom: 7px; }
+.memo-steps { border-top: 1px solid var(--border); margin-top: 15px; padding-top: 13px; }
+.memo-steps .eyebrow { display: block; margin-bottom: 8px; }
+.self-check-chip { color: var(--teal); border-color: var(--teal); }
+@media (max-width: 720px) {
+  .page-heading { flex-direction: column; align-items: flex-start; }
+  .memo-summary { font-size: 10px; }
+}
