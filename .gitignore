@@ -1,0 +1,24 @@
+# Dependencies and build outputs
+node_modules/
+frontend/dist/
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+# Secrets and runtime data
+.env
+.env.*
+*.pem
+*.key
+workspace/
+*.db
+*.db-*
+*.sqlite3
+*.sqlite3-*
+# Local agent workspace metadata
+.workbuddy-ai/
+# Generated demo/validation artifacts and release archives
+outputs/out-in/demo/
+outputs/*.zip
+outputs/out-in-*-validation-*/
