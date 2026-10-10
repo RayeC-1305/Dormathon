@@ -17,15 +17,75 @@ in every mode. No real funds are moved.**
 | `outputs/out-in/` | The actual application (backend, tools, frontend, tests, docs) |
 | `out-in-sdk-starter/` | Original chat SDK starter retained as provenance reference only |
 
-## Quick start (Windows PowerShell 5.1, Python 3.13, Node 22.20+)
+## Prerequisites
+
+- **Python 3.13+** — verify: `python --version`
+- **Node.js 22.20+** — verify: `node --version`
+- **npm** on PATH — verify: `npm --version`
+
+## Quick start
+
+### Option A — One-command deploy (Windows PowerShell)
+
+From the repository root:
 
 ```powershell
 & ./outputs/out-in/scripts/deploy_demo.ps1 -CopyKeyToClipboard
 ```
 
-Then open http://127.0.0.1:8000, paste the operator key from the clipboard, and
-click **Run end-to-end demo** — one action executes the full autonomous
-underwriting pipeline on the synthetic dossier.
+This creates the venv, installs all dependencies, builds the frontend, generates
+synthetic demo assets, starts the server, and copies the operator key to your
+clipboard. When it finishes, open http://127.0.0.1:8000 and paste the key.
+
+For subsequent runs (everything already built):
+
+```powershell
+& ./outputs/out-in/scripts/deploy_demo.ps1 -ReuseEnvironment -ReuseWorkspace -CopyKeyToClipboard
+```
+
+### Option B — Manual setup (any platform)
+
+```bash
+# 1. Go to the app directory
+cd outputs/out-in
+
+# 2. Create a Python virtual environment
+python3.13 -m venv .venv
+
+# 3. Install Python dependencies
+#    Windows:  ./.venv/Scripts/python.exe -m pip install -r requirements.txt
+#    macOS/Linux: ./.venv/bin/python -m pip install -r requirements.txt
+.venv/Scripts/python.exe -m pip install -r requirements.txt   # Windows
+# .venv/bin/python -m pip install -r requirements.txt          # macOS/Linux
+
+# 4. Install and build the frontend
+npm --prefix frontend ci --include=dev --no-audit --no-fund
+npm --prefix frontend run build
+
+# 5. Generate synthetic demo assets (models, invoice, statement, dossier ZIP)
+.venv/Scripts/python.exe scripts/prepare_demo.py   # Windows
+# .venv/bin/python scripts/prepare_demo.py           # macOS/Linux
+
+# 6. Start the server
+#    Windows:
+.venv/Scripts/python.exe -m uvicorn agent_service.app:app --host 127.0.0.1 --port 8000 --workers 1
+#    macOS/Linux:
+# .venv/bin/python -m uvicorn agent_service.app:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+The server prints `Application startup complete.` when ready.
+
+### Use the app
+
+1. Open **http://127.0.0.1:8000** in your browser.
+2. Enter the operator API key:
+   - If you used `-CopyKeyToClipboard`, paste from clipboard.
+   - If you started manually, the key is whatever you set in `OUT_IN_API_KEY`.
+     If you didn't set one, demo mode allows any non-empty value — type any text.
+3. Click **Run end-to-end demo** to execute the full autonomous underwriting
+   pipeline on the synthetic dossier with one click.
+4. Watch the four-stage pipeline (extraction → reconciliation → risk →
+   settlement), live metrics, decision memo, and artifact vault in real time.
 
 ## Documentation
 
@@ -40,11 +100,19 @@ underwriting pipeline on the synthetic dossier.
 
 ## Verification
 
-```powershell
+```bash
 cd outputs/out-in
-& ./.venv/Scripts/python.exe scripts/prepare_demo.py
-& ./.venv/Scripts/python.exe -m pytest tests -q   # 992 offline tests
-npm.cmd --prefix frontend run build
+
+# Generate demo assets (skip if already done)
+.venv/Scripts/python.exe scripts/prepare_demo.py          # Windows
+# .venv/bin/python scripts/prepare_demo.py                  # macOS/Linux
+
+# Run the full test suite (992 offline tests)
+.venv/Scripts/python.exe -m pytest tests -q                # Windows
+# .venv/bin/python -m pytest tests -q                        # macOS/Linux
+
+# Build the frontend
+npm --prefix frontend run build
 ```
 
 Current executed suite: 992 passing offline tests and a clean Vite production
