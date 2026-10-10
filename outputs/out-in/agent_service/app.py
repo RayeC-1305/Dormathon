@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import secrets
+import shutil
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -162,17 +163,49 @@ async def ingest(files: list[UploadFile] = File(...), requested_limit: str = For
                  "annual_rate": str(rate), "monthly_debt_service": str(debt)}
         if document_ids:
             terms["myinvois_document_ids"] = document_ids
-        jid, token = store.create(MODE, terms, sources)
-        target = WORKSPACE / "jobs" / jid
-        target.mkdir(parents=True)
-        os.rename(directory, target / "inputs")
-        task = asyncio.create_task(engine.run(jid))
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
-        return {"job_id": jid, "stream_token": token, "state": "QUEUED"}
+        return schedule_job(directory, terms, sources)
     except HTTPException:
         # Retain rejected payloads in isolated incoming directory. No unsafe deletes.
         raise
+
+
+def schedule_job(directory, terms, sources):
+    jid, token = store.create(MODE, terms, sources)
+    target = WORKSPACE / "jobs" / jid
+    target.mkdir(parents=True)
+    os.rename(directory, target / "inputs")
+    task = asyncio.create_task(engine.run(jid))
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return {"job_id": jid, "stream_token": token, "state": "QUEUED"}
+
+
+DEMO_RUN_FILES = ("invoice.pdf", "packing_list.pdf", "statement.xlsx")
+DEMO_RUN_TERMS = {"requested_limit": "40000.00", "duration_months": 12,
+                  "annual_rate": "0.08", "monthly_debt_service": "1000.00"}
+
+
+@app.post("/api/v2/demo-run", status_code=202, dependencies=[Depends(auth)])
+async def demo_run():
+    """One action, end-to-end: stage the generated synthetic dossier with the
+    canonical demo terms and run the same validated intake/scheduler path as a
+    manual upload. Demo mode only; settlement remains simulated."""
+    if MODE != "demo":
+        raise HTTPException(409, "Synthetic one-action runs require demo mode")
+    if len(tasks) >= 8:
+        raise HTTPException(429, "Runtime queue full; retry later")
+    fixtures = [ROOT / "demo" / "dossier" / name for name in DEMO_RUN_FILES]
+    if any(not path.is_file() or path.is_symlink() for path in fixtures):
+        raise HTTPException(404, "Run python scripts/prepare_demo.py first")
+    directory = WORKSPACE / "incoming" / secrets.token_hex(16)
+    directory.mkdir(parents=True)
+    sources = []
+    for fixture in fixtures:
+        target = directory / fixture.name
+        shutil.copyfile(fixture, target)
+        await asyncio.to_thread(inspect_upload, target)
+        sources.append({"name": fixture.name, "sha256": hash_file(target)})
+    return schedule_job(directory, dict(DEMO_RUN_TERMS), sources)
 
 
 @app.get("/api/v2/jobs/{jid}", dependencies=[Depends(auth)])
