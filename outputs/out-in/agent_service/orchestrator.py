@@ -18,6 +18,8 @@ from tools.reconciliation_tool import EvidenceError, ParityViolation, dec, money
 from tools.ocr_tool import run_ocr_normalizer, parse_demo_packet
 from tools.ml_underwrite_tool import evaluate_credit_ml
 from tools.artifact_tool import build_artifacts
+from tools.decision_memo_tool import build_decision_memo, expected_figures
+from tools.selfcheck_tool import verify_bundle_integrity
 from tools.myinvois_tool import parse_myinvois_invoice, bind_myinvois_trade
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,16 +116,19 @@ class UnderwritingEngine:
                 write_json(directory / "evidence" / "myinvois-invoices.json", structured)
             proposal, audit, regions = None, None, {}
             for attempt in range(4):
-                normalized, paths = [], []
-                for path in pdfs:
+                async def normalize_pdf(path):
                     packet = await call(AGENTS[0], "run_ocr_normalizer", run_ocr_normalizer, str(path), regions.get(path.name), attempt)
                     # Crop paths are server internals; only normalized text reaches SDK.
                     for crop in packet.get("crops", []):
                         crop.pop("local_crop", None)
                     target = directory / "normalized" / f"{path.stem}-cycle-{attempt}.json"
                     write_json(target, packet)
-                    paths.append(target)
-                    normalized.append(packet)
+                    return target, packet
+
+                # Dossier PDFs normalize concurrently; gather preserves dossier order.
+                results = await asyncio.gather(*(normalize_pdf(path) for path in pdfs))
+                paths = [target for target, _ in results]
+                normalized = [packet for _, packet in results]
                 if mode == "demo":
                     packets = [parse_demo_packet(p) for p in normalized]
                     proposal = {"invoices": [p["data"] for p in packets if p["kind"] == "invoice"],
@@ -223,6 +228,32 @@ class UnderwritingEngine:
             risk = await call(AGENTS[2], "evaluate_credit_ml", evaluate_credit_ml, features,
                               str(model_dir), mode, terms["requested_limit"], terms["duration_months"], terms["annual_rate"])
             write_json(directory / "evidence" / "risk.json", risk)
+            # Advisory plain-language memo. Deterministic text is always computed;
+            # the opt-in live SDK narrative agent may only restate it, and its
+            # figures must equal the deterministic evidence before acceptance.
+            narrative, narrative_source = None, "deterministic"
+            figures = expected_figures(audit, risk, terms)
+            if mode == "live" and os.environ.get("OUT_IN_NARRATIVE_AGENT") == "1":
+                from agent_service.sdk_runtime import NARRATIVE_PERSONA_NAME, NarrativeRuntime
+
+                emit("TOOL_EXECUTION", {"agent": NARRATIVE_PERSONA_NAME, "tool": "draft_decision_memo",
+                                        "status": "STARTED", "cycle": attempt})
+                try:
+                    narrative = await NarrativeRuntime(directory, emit).narrate(
+                        [directory / "evidence" / f"audit-{attempt}.json",
+                         directory / "evidence" / "features.json",
+                         directory / "evidence" / "risk.json"], figures)
+                    narrative_source = "sdk_agent"
+                    emit("TOOL_EXECUTION", {"agent": NARRATIVE_PERSONA_NAME, "tool": "draft_decision_memo",
+                                            "status": "COMPLETED", "cycle": attempt})
+                except Exception:
+                    # The memo is advisory; fail-safe to the deterministic text.
+                    narrative, narrative_source = None, "deterministic_fallback"
+                    emit("TOOL_EXECUTION", {"agent": NARRATIVE_PERSONA_NAME, "tool": "draft_decision_memo",
+                                            "status": "FAILED", "cycle": attempt})
+            memo = build_decision_memo(audit, risk, terms, narrative=narrative, narrative_source=narrative_source)
+            write_json(directory / "evidence" / "decision_memo.json", memo)
+            self.store.update(jid, decision_memo=memo)
             metrics = {**self.store.get(jid)["metrics"], **risk}
             self.store.update(jid, metrics=metrics)
             emit("METRICS", metrics)
@@ -264,6 +295,13 @@ class UnderwritingEngine:
             names = await call(AGENTS[3], "compile_tnc_agreement", build_artifacts, directory, evidence_sources,
                                proposal["invoices"], audit, risk, verified_terms, "demo", template)
             validate_sources()
+            # Built-in quality gate: re-verify the exact committed bundle and every
+            # declared source before the job may report COMPLETED. Failure closes
+            # the job as FAILED and rolls back the simulated wallet record.
+            self_check = await call(AGENTS[3], "verify_bundle_integrity", verify_bundle_integrity, directory)
+            write_json(directory / "self_check.json", self_check)
+            self.store.update(jid, metrics={**self.store.get(jid)["metrics"], "self_check": self_check})
+            emit("METRICS", {"self_check": self_check})
             self.store.finalize_demo(jid)
             vault = [{"name": n, "url": f"/api/v2/jobs/{jid}/artifacts/{n}"} for n in names]
             self.store.update(jid, artifacts=vault, settlement="SIMULATED_ONLY", legal_status="demo_attestation_not_legal_countersignature")
